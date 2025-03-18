@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn==0.34.0
+pydantic==2.10.0
+celery==5.3.4
+redis==5.0.0
+httpx==0.24.1
+python-dotenv==1.0.0
+openai==1.65.0
+langchain==0.0.267
+sqlalchemy==2.0.20
+alembic==1.15.0
+pytest==8.3.0
+mkdocs-material
+mkdocs

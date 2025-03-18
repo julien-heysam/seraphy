@@ -1,0 +1,28 @@
+site_name: My site
+site_url: https://mydomain.org/mysite
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - API Documentation: api.md
+
+plugins:
+- search
+- mkdocstrings:
+    handlers:
+      python:
+        paths: ["."]
+        options:
+          docstring_style: google
+          show_source: true
+          show_root_heading: true
+          show_if_no_docstring: true
+          heading_level: 3
+          show_signature_annotations: true
+
+watch:
+  - core
+  - api
+  - schemas
+  - utils
