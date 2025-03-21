@@ -1,3 +1,4 @@
+import logging
 import time
 import signal
 import threading
@@ -5,7 +6,14 @@ import sys
 import os
 import datetime
 import json
+from typing import Any
 
+import easyocr
+from difflib import SequenceMatcher
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium import webdriver
 import traceback
@@ -16,6 +24,8 @@ import pyautogui
 
 from backend import PROJECT_PATHS
 from backend.infrastructure.enhanced_browser.base import EnhancedBrowser
+
+logger = logging.getLogger(__name__)
 
 
 class SeleniumEnhancedBrowser(EnhancedBrowser):
@@ -45,7 +55,9 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
         
         # Initialize the WebDriver
         self.driver = webdriver.Chrome(options=options)
-        
+        self.reader = easyocr.Reader(['en'])
+        self.wait = WebDriverWait(self.driver, 10)
+
         # Set up cleanup handlers
         atexit.register(self.cleanup)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -59,7 +71,8 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
             'textarea': {'color': '#FF4500', 'bg': 'rgba(255, 69, 0, 0.2)'}, # Neon Orange
             'default': {'color': '#00FF00', 'bg': 'rgba(0, 255, 0, 0.2)'}    # Lime Green
         }
-        
+        self.element_mapping = {}
+
         # Screen recording variables
         self.start_time = time.time()
         self.video_output_file = None
@@ -79,6 +92,93 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
         self._monitor_thread.start()
         self.output_dir = PROJECT_PATHS.RAW_DATA / 'recordings'
     
+    def move_to_element_xpath(self, action: dict):
+        xpath = action.get('xpath')
+        if not xpath:
+            raise Exception("No xpath provided")
+
+        element = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+        logger.info(f"Hovering over element at {xpath}...")
+        actions = ActionChains(self.driver)
+        actions.move_to_element(element).perform()
+
+        return element
+
+    def move_mouse_to(self, x, y):
+        actions = ActionChains(self.driver)
+        actions.move_by_offset(x, y).perform()
+
+    def click_element(self, element):
+        element.click()
+        time.sleep(1)
+
+    def find_text_position(self, target_text: str, threshold: float = 0.85, similarity_threshold: float = 0.8) -> tuple[int, int]:
+        """Find the position of text in the current browser window"""
+        screenshot = self.capture_browser_screenshot()
+        
+        # Get all text regions in the image
+        results = self.reader.readtext(screenshot)
+        
+        best_match = None
+        best_score = 0
+        
+        for (bbox, text, score) in results:
+            # Normalize texts for comparison
+            text = text.lower().strip()
+            target = target_text.lower().strip()
+            
+            similarity = self.text_similarity(text, target)
+            if similarity > similarity_threshold and score > threshold:
+                if score > best_score:
+                    best_match = bbox
+                    best_score = score
+        
+        if best_match is None:
+            raise Exception(f"Could not find text '{target_text}' on screen")
+        
+        # Calculate center point of the bounding box
+        # bbox format is: [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+        center_x = int((best_match[0][0] + best_match[2][0]) / 2)
+        center_y = int((best_match[0][1] + best_match[2][1]) / 2)
+        
+        return center_x, center_y
+
+    def save_element_mapping_to_file(self, path: str = "element_mapping.json"):
+        """Save the current element mapping to a file for later analysis"""
+        # if not self.element_mapping:
+        self.highlight_clickable_elements()
+            
+        with open(path, 'w') as f:
+            json.dump(self.element_mapping, f, indent=2)
+ 
+    def text_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two texts"""
+        return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+
+    def get_element_by_text(self, target_text: str) -> dict[str, Any]:
+        """Find an element in the mapping by matching its text"""
+        if not self.element_mapping:
+            self.highlight_clickable_elements()
+
+        best_match = None
+        best_score = 0
+        best_id = None
+        for element_id, element_info in self.element_mapping.items():
+            element_text = element_info['text']
+            similarity = self.text_similarity(element_text, target_text)
+            if similarity > 0.8 and similarity > best_score:
+                best_match = element_info
+                best_score = similarity
+                best_id = element_id
+                
+        if not best_match:
+            raise Exception(f"Could not find element with text '{target_text}'")
+        
+        # Add the element ID to the result for direct clicking
+        best_match['element_id'] = best_id
+
+        return best_match
+
     def _signal_handler(self, signum, frame):
         self.cleanup()
         sys.exit(0)
@@ -97,6 +197,22 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
         except:
             pass
     
+    def capture_browser_screenshot(self) -> np.ndarray:
+        """Capture current browser window state"""
+        x, y, width, height = self.get_browser_coordinates()
+        screenshot = pyautogui.screenshot(region=(x, y, width, height))
+
+        return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+
+    def get_screenshot(self) -> tuple[str, np.ndarray]:
+        """Save current browser window state to a file"""
+        screenshot = self.capture_browser_screenshot()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = PROJECT_PATHS.RAW_DATA / "recordings" / "screenshots" / f"screenshot_{timestamp}.png"
+        cv2.imwrite(screenshot_path, screenshot)
+
+        return screenshot_path, screenshot
+
     def _start_action_recording(self):
         """Start recording user actions"""
         if self.action_recording:
@@ -1265,8 +1381,8 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
                                 rect.bottom <= window.innerHeight && 
                                 rect.right <= window.innerWidth) {
                                 label.style.display = 'block';
-                                // Position the label at the top-left corner of the element
-                                label.style.top = `${rect.top}px`;
+                                // Position the label outside, just below the element
+                                label.style.top = `${rect.bottom + 2}px`;
                                 label.style.left = `${rect.left}px`;
                             } else {
                                 label.style.display = 'none';
@@ -1314,7 +1430,7 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
                 };
                 
                 window.addEventListener('scroll', window._scrollHandler, { passive: true });
-                window.addEventListener('resize', window._scrollHandler, { passive: true });
+                window.addEventListener('rDicte', window._scrollHandler, { passive: true });
                 
                 return uniqueElements.length;
             """ % (selectors, self.colors, self.colors, self.colors)
@@ -1327,6 +1443,157 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
             traceback.print_exc()
             return 0
     
+    def get_browser_coordinates(self) -> tuple[int, int, int, int]:
+        """Get the current browser window position and dimensions"""
+        window_rect = self.driver.get_window_rect()
+        
+        return (
+            window_rect['x'],
+            window_rect['y'],
+            window_rect['width'],
+            window_rect['height']
+        )
+    
+    def click_at_position(self, x: int, y: int):
+        """Click at specific coordinates relative to browser window"""
+        try:
+            # First try to use Selenium's built-in actions for more reliable clicking
+            # This works with elements that are within the viewport
+            actions = ActionChains(self.driver)
+            actions.move_by_offset(x, y).click().perform()
+            # Reset actions to avoid compounding offsets in future calls
+            actions.reset_actions()
+            time.sleep(0.5)  # Wait for any animations/changes
+        except Exception as e:
+            # Fall back to pyautogui if Selenium actions fail
+            print(f"Selenium click failed, falling back to pyautogui: {str(e)}")
+            browser_x, browser_y, _, _ = self.get_browser_coordinates()
+            # Convert coordinates relative to browser window to absolute screen coordinates
+            abs_x = browser_x + x
+            abs_y = browser_y + y
+            
+            # Save current mouse position to restore after click
+            original_x, original_y = pyautogui.position()
+            
+            # Smooth move to position (more human-like)
+            pyautogui.moveTo(abs_x, abs_y, duration=0.5)
+            time.sleep(0.1)  # Small pause before click
+            pyautogui.click(abs_x, abs_y)
+            time.sleep(0.5)  # Wait for any animations/changes
+            
+            # Return cursor to original position if it's not where we clicked
+            # This helps prevent interference with manual development
+            if original_x != abs_x or original_y != abs_y:
+                pyautogui.moveTo(original_x, original_y, duration=0.3)
+
+    def type_text(self, text: str):
+        """Type text at current cursor position"""
+        pyautogui.write(text, interval=0.1)
+
+    def highlight_clickable_elements(self) -> dict[str, Any]:
+        """
+        Uses the browser's built-in highlight_elements method and builds
+        a mapping of element IDs to their details for automation.
+        """
+        # Now we need to get the mapping of elements to their positions
+        mapping_script = """
+        const elementMap = {};
+        document.querySelectorAll('[data-highlight-id]').forEach(el => {
+            const index = el.getAttribute('data-highlight-id');
+            const rect = el.getBoundingClientRect();
+            
+            elementMap[parseInt(index) + 1] = {
+                tag: el.tagName,
+                text: el.textContent.trim().substring(0, 50), // Limit text length
+                x: Math.round(rect.left + rect.width/2),  // center x
+                y: Math.round(rect.top + rect.height/2),  // center y
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                href: el.href || null,
+                id: el.id || null,
+                className: el.className || null
+            };
+        });
+        
+        return elementMap;
+        """
+        # Execute the mapping script to get the details of highlighted elements
+        element_map = self.driver.execute_script(mapping_script)
+        self.element_mapping = element_map
+
+        return element_map
+
+    def click_element_by_number(self, element_number: int):
+        """Click an element by its numbered identifier"""
+        # if not self.element_mapping:
+        self.highlight_clickable_elements()
+            
+        if str(element_number) not in self.element_mapping:
+            raise Exception(f"Element number {element_number} not found in mapping")
+        
+        element_info = self.element_mapping[str(element_number)]
+        # Try to find and click the element directly with JavaScript for more reliability
+        js_click = """
+        const elements = document.querySelectorAll('[data-highlight-id]');
+        for (const el of elements) {
+            if (el.getAttribute('data-highlight-id') === arguments[0]) {
+                // Scroll element into view if needed
+                el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                
+                // Use a small delay to ensure the element is in view
+                setTimeout(() => {
+                    // Simulate a more natural click with mouse events
+                    const rect = el.getBoundingClientRect();
+                    const centerX = rect.left + rect.width/2;
+                    const centerY = rect.top + rect.height/2;
+                    
+                    // Create and dispatch mouse events
+                    const mouseDown = new MouseEvent('mousedown', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY
+                    });
+                    
+                    const mouseUp = new MouseEvent('mouseup', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY
+                    });
+                    
+                    const click = new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY
+                    });
+                    
+                    el.dispatchEvent(mouseDown);
+                    el.dispatchEvent(mouseUp);
+                    el.dispatchEvent(click);
+                }, 500);
+                
+                return true;
+            }
+        }
+        return false;
+        """
+        
+        try:
+            clicked = self.driver.execute_script(js_click, str(int(element_number) - 1))
+            if clicked:
+                time.sleep(1)  # Wait for any animations/changes after JavaScript click
+                return
+        except Exception as e:
+            print(f"JavaScript click failed: {str(e)}")
+        
+        # If JavaScript click fails, fall back to coordinate-based click
+        self.click_at_position(element_info['x'], element_info['y'])
+
     def run(self) -> None:
         """Main loop - wait until browser is closed"""
         try:
@@ -1340,6 +1607,7 @@ class SeleniumEnhancedBrowser(EnhancedBrowser):
                     break
         finally:
             self.cleanup()
+
 
 if __name__ == "__main__":
     agent = SeleniumEnhancedBrowser()
